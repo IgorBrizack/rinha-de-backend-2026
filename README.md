@@ -42,6 +42,8 @@ A comunicação entre nginx e as instâncias da API usa **Unix Domain Sockets (U
 2. nginx e as APIs compartilham o diretório `/run/sockets` via Docker named volume
 3. Se `SOCKET_PATH` não estiver definido, o servidor cai para TCP na `PORT` (útil para execução local sem Docker)
 
+**Referência:** implementação equivalente em Node.js usando `uWebSockets.js` com `.listen_unix()` — [jairoblatt/rinha-2026-node](https://github.com/jairoblatt/rinha-2026-node)
+
 ### Estrutura de pastas
 
 ```
