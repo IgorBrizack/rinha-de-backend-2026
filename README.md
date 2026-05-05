@@ -22,25 +22,37 @@ API de detecção de fraudes para a [Rinha de Backend 2026](https://github.com/z
 - **API**: Go 1.24, stdlib pura, sem dependências externas
 - **Limites de recursos**: 1 CPU / 350 MB total (nginx 0.1/50MB, cada instância 0.45/150MB)
 
-### Estrutura interna (DDD)
+### Estrutura de pastas
 
 ```
+cmd/
+  server/
+    main.go           ← entrypoint: lê PORT e sobe o HTTP server
 internal/
-  domain/       ← entidades e interface FraudScorer
-  usecase/      ← ScoreFraud (orquestração)
-  scorer/       ← implementação do scorer (NoOp placeholder)
-  handler/      ← HTTP handlers e roteamento
+  domain/
+    fraud.go          ← entidades (FraudInput, FraudResult) e interface FraudScorer
+  usecase/
+    fraud_score.go    ← ScoreFraud: orquestra a chamada ao scorer
+  scorer/
+    noop.go           ← implementação placeholder (aprova tudo, score 0.0)
+  handler/
+    router.go         ← monta o http.ServeMux com as rotas
+    fraud.go          ← POST /fraud-score: decode, mapeia para domain, chama usecase
+    ready.go          ← GET /ready: healthcheck
 ```
 
 ## Endpoints
 
 ### `GET /ready`
-Verificação de prontidão. Retorna `200 OK` quando a API está pronta.
+
+Healthcheck. Retorna `200 OK` quando a instância está pronta para receber tráfego.
 
 ### `POST /fraud-score`
-Avalia o risco de fraude de uma transação.
 
-**Request:**
+Avalia o risco de fraude de uma transação e retorna se ela deve ser aprovada.
+
+**Request**
+
 ```json
 {
   "id": "tx-3576980410",
@@ -71,7 +83,8 @@ Avalia o risco de fraude de uma transação.
 }
 ```
 
-**Response:**
+**Response**
+
 ```json
 {
   "approved": true,
@@ -79,35 +92,106 @@ Avalia o risco de fraude de uma transação.
 }
 ```
 
-## Como executar
+## Comandos disponíveis
 
-### Produção
-
-```bash
-docker compose up --build
+```
+  dev             Sobe o ambiente de desenvolvimento com hot reload
+  dev-debug       Sobe o ambiente de desenvolvimento sem hot reload (pronto para Delve)
+  down            Derruba o ambiente de desenvolvimento
+  down-v          Derruba o ambiente de desenvolvimento e remove volumes
+  logs            Exibe os logs do ambiente de desenvolvimento
+  rebuild         Reconstrói as imagens e sobe o ambiente de desenvolvimento
+  prod            Sobe o ambiente de produção
+  prod-down       Derruba o ambiente de produção
+  build           Compila o binário localmente
+  run             Compila e executa localmente (PORT=8080)
+  test            Executa os testes
+  vet             Executa go vet
+  help            Exibe esta mensagem de ajuda
 ```
 
-Acesse em `http://localhost:9999`.
+> Execute `make help` para ver todos os comandos com descrições.
 
-### Desenvolvimento (hot reload + debug)
+## Desenvolvimento
+
+### Pré-requisitos
+
+- [Docker](https://docs.docker.com/get-docker/) e Docker Compose
+- [Go 1.24+](https://go.dev/dl/) (apenas para build e execução local)
+
+### Subindo o ambiente dev
 
 ```bash
-docker compose -f docker-compose.dev.yaml up --build
+make dev
 ```
 
-O [Air](https://github.com/air-verse/air) monitora alterações nos arquivos `.go` e recompila automaticamente.
+O [Air](https://github.com/air-verse/air) monitora alterações nos arquivos `.go` e recompila automaticamente. A API fica disponível em `http://localhost:9999`.
 
-#### Debug remoto com VS Code
-
-1. Suba o ambiente dev conforme acima
-2. No VS Code, acesse **Run and Debug** (`Ctrl+Shift+D`)
-3. Selecione **Delve into Docker** e pressione `F5`
-
-O Delve se conecta ao container `rinha-api1` na porta `2345`.
-
-## Desenvolvimento local (sem Docker)
+### Derrubando o ambiente dev
 
 ```bash
-go build ./cmd/server
-PORT=8080 ./server
+make down        # para os containers
+make down-v      # para os containers e remove os volumes de cache do Go
+```
+
+### Reconstruindo as imagens
+
+Necessário após alterar `Dockerfile.dev`, `go.mod` ou dependências:
+
+```bash
+make rebuild
+```
+
+## Debug remoto com VS Code
+
+O ambiente de debug desabilita o hot reload para que o processo não seja reiniciado durante a sessão do Delve.
+
+**1. Suba o ambiente em modo debug:**
+
+```bash
+make dev-debug
+```
+
+**2. Aguarde o build inicial** — o Air compila o binário uma vez e mantém o processo rodando sem observar arquivos.
+
+**3. Inicie o debug no VS Code:**
+
+- Acesse **Run and Debug** (`Ctrl+Shift+D`)
+- Selecione **Delve into Docker**
+- Pressione `F5`
+
+O VS Code executa automaticamente a task `attach-delve`, que roda `dlv attach` dentro do container `rinha-api1` na porta `2345`, e conecta o debugger ao processo em execução.
+
+### Como funciona internamente
+
+| Componente | Detalhe |
+|---|---|
+| `air.debug.toml` | Igual ao `air.toml`, mas com `include_ext = []` — Air compila uma vez e não observa mudanças |
+| `AIR_CONFIG` | Variável de ambiente lida pelo entrypoint do container (`air -c ${AIR_CONFIG:-air.toml}`) |
+| `cap_add: SYS_PTRACE` | Permite que o Delve use `ptrace` para se anexar ao processo dentro do container |
+| `security_opt: seccomp:unconfined` | Remove o perfil seccomp padrão do Docker que bloqueia syscalls de ptrace |
+| `preLaunchTask` | Executa `nohup dlv attach <PID>` no container e aguarda 1s para o Delve estar pronto |
+| `postDebugTask` | Mata o processo `dlv` no container ao encerrar a sessão |
+| `substitutePath` | Mapeia `/home/.../rinha_backend_2026/` → `/app/` para o VS Code encontrar os arquivos fonte |
+
+### Versões do Delve
+
+O Delve instalado no container (`Dockerfile.dev`) deve ter a mesma versão do Delve local usado pelo VS Code. Versão atual: **v1.25.2**.
+
+Para verificar a versão local:
+
+```bash
+dlv version
+```
+
+## Produção
+
+```bash
+make prod
+```
+
+A imagem de produção usa um build multi-stage: compila o binário com `golang:1.24-alpine` e copia apenas o executável para uma imagem `alpine:3.20` mínima. O servidor roda como usuário não-root.
+
+```bash
+make prod-down   # derruba o ambiente de produção
 ```

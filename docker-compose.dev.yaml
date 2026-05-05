@@ -22,8 +22,13 @@ services:
       - go-pkg-cache:/go/pkg/mod
     environment:
       - PORT=8080
+      - AIR_CONFIG=${AIR_CONFIG:-air.toml}
     ports:
       - "2345:2345"
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
     networks:
       - rinha-network
 

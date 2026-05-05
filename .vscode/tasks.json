@@ -4,12 +4,12 @@
     {
       "label": "attach-delve",
       "type": "shell",
-      "command": "docker exec -d rinha-api1 sh -c 'APP_PID=$(pgrep -f \"/app/tmp/main\"); dlv --listen=:2345 --headless=true --accept-multiclient attach $APP_PID'"
+      "command": "docker exec rinha-api1 sh -c 'APP_PID=$(pgrep -f \"/app/tmp/main\"); nohup dlv --listen=:2345 --headless=true --accept-multiclient --api-version=2 attach $APP_PID > /tmp/dlv.log 2>&1 &' && sleep 1"
     },
     {
       "label": "dettach-delve",
       "type": "shell",
-      "command": "docker exec -d rinha-api1 sh -c 'DLV_PID=$(pgrep -f dlv); kill -9 $DLV_PID'"
+      "command": "docker exec rinha-api1 sh -c 'DLV_PID=$(pgrep -f dlv); kill -9 $DLV_PID'"
     }
   ]
 }
