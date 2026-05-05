@@ -1,0 +1,22 @@
+# Build stage
+FROM golang:1.25-alpine AS deps
+
+WORKDIR /app
+
+RUN CGO_ENABLED=0 go install -ldflags "-s -w -extldflags '-static'" github.com/go-delve/delve/cmd/dlv@v1.21.2
+RUN CGO_ENABLED=0 go install github.com/air-verse/air@v1.61.0
+
+# Final stage
+FROM golang:1.25-alpine AS final
+
+WORKDIR /app
+
+COPY --from=deps /go/bin /go/bin
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+EXPOSE 8080
+EXPOSE 2345
+
+ENTRYPOINT ["air", "-c", "air.toml"]

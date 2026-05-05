@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "attach-delve",
+      "type": "shell",
+      "command": "docker exec -d rinha-api1 sh -c 'APP_PID=$(pgrep -f \"/app/tmp/main\"); dlv --listen=:2345 --headless=true --accept-multiclient attach $APP_PID'"
+    },
+    {
+      "label": "dettach-delve",
+      "type": "shell",
+      "command": "docker exec -d rinha-api1 sh -c 'DLV_PID=$(pgrep -f dlv); kill -9 $DLV_PID'"
+    }
+  ]
+}
