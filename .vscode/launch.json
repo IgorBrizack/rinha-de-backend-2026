@@ -6,6 +6,7 @@
       "type": "go",
       "request": "attach",
       "mode": "remote",
+      "debugAdapter": "legacy",
       "substitutePath": [
         {
           "from": "${workspaceFolder}/",
