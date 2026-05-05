@@ -3,6 +3,7 @@ services:
     image: nginx:1.27-alpine
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/run/sockets
     ports:
       - "9999:9999"
     depends_on:
@@ -20,8 +21,9 @@ services:
       - .:/app
       - go-build-cache:/root/.cache/go-build
       - go-pkg-cache:/go/pkg/mod
+      - sockets:/run/sockets
     environment:
-      - PORT=8080
+      - SOCKET_PATH=/run/sockets/api1.sock
       - AIR_CONFIG=${AIR_CONFIG:-air.toml}
     ports:
       - "2345:2345"
@@ -40,14 +42,16 @@ services:
       - .:/app
       - go-build-cache:/root/.cache/go-build
       - go-pkg-cache:/go/pkg/mod
+      - sockets:/run/sockets
     environment:
-      - PORT=8080
+      - SOCKET_PATH=/run/sockets/api2.sock
     networks:
       - rinha-network
 
 volumes:
   go-build-cache:
   go-pkg-cache:
+  sockets:
 
 networks:
   rinha-network:
