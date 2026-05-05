@@ -5,11 +5,11 @@ COMPOSE_PROD = docker compose
 
 .PHONY: dev
 dev: ## Sobe o ambiente de desenvolvimento com hot reload
-	$(COMPOSE_DEV) up --build
+	$(COMPOSE_DEV) up -d --build
 
 .PHONY: dev-debug
 dev-debug: ## Sobe o ambiente de desenvolvimento sem hot reload (pronto para Delve)
-	AIR_CONFIG=air.debug.toml $(COMPOSE_DEV) up --build
+	AIR_CONFIG=air.debug.toml $(COMPOSE_DEV) up -d --build
 
 .PHONY: down
 down: ## Derruba o ambiente de desenvolvimento
