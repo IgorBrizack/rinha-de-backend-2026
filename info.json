@@ -1,8 +1,7 @@
 {
-  "id": "igorbrizack-go",
-  "nome": "Igor Brizack",
-  "github": "IgorBrizack",
-  "linguagem": "Go",
-  "framework": "net/http (stdlib)",
-  "observacoes": "KNN k=5 com dataset quantizado i16, brute-force scan, Unix Domain Sockets, zero dependências externas"
+    "participants": ["Igor Brizack"],
+    "social": ["https://github.com/IgorBrizack/"],
+    "source-code-repo": "https://github.com/IgorBrizack/rinha-de-backend-2026",
+    "stack": ["go", "nginx"],
+    "open_to_work": false
 }
