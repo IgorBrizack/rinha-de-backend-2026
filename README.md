@@ -13,21 +13,43 @@ API de detecção de fraudes para a [Rinha de Backend 2026](https://github.com/z
                   ┌──────────────────┴──────────────────┐
                   ▼                                      ▼
          ┌────────────────┐                   ┌────────────────┐
-         │   api1 :8080   │                   │   api2 :8080   │
-         │   (Go/stdlib)  │                   │   (Go/stdlib)  │
+         │     api1       │                   │     api2       │
+         │  (Go/stdlib)   │                   │  (Go/stdlib)   │
          └────────────────┘                   └────────────────┘
+              ▲                                      ▲
+              │ /run/sockets/api1.sock               │ /run/sockets/api2.sock
+              └──────────────────────────────────────┘
+                         (Unix Domain Sockets)
 ```
 
 - **Load balancer**: nginx com round-robin simples, sem lógica de negócio
+- **Comunicação nginx ↔ API**: Unix Domain Sockets via volume compartilhado `/run/sockets`
 - **API**: Go 1.24, stdlib pura, sem dependências externas
 - **Limites de recursos**: 1 CPU / 350 MB total (nginx 0.1/50MB, cada instância 0.45/150MB)
+
+### Unix Domain Sockets
+
+A comunicação entre nginx e as instâncias da API usa **Unix Domain Sockets (UDS)** em vez de TCP. Diferentemente de TCP, UDS não percorre a pilha de rede do kernel — os dados trafegam diretamente pelo VFS, eliminando o overhead de empacotamento, checksums e travessia de namespace de rede.
+
+| | TCP | Unix Domain Socket |
+|---|---|---|
+| Caminho no kernel | Pilha TCP/IP completa | VFS direto |
+| Namespace de rede | Sim | Não |
+| Latência relativa | Base | ~30-40% menor |
+
+**Como funciona:**
+1. Cada instância da API cria seu socket ao iniciar: `api1` → `/run/sockets/api1.sock`, `api2` → `/run/sockets/api2.sock`
+2. nginx e as APIs compartilham o diretório `/run/sockets` via Docker named volume
+3. Se `SOCKET_PATH` não estiver definido, o servidor cai para TCP na `PORT` (útil para execução local sem Docker)
+
+**Referência:** implementação equivalente em Node.js usando `uWebSockets.js` com `.listen_unix()` — [jairoblatt/rinha-2026-node](https://github.com/jairoblatt/rinha-2026-node)
 
 ### Estrutura de pastas
 
 ```
 cmd/
   server/
-    main.go           ← entrypoint: lê PORT e sobe o HTTP server
+    main.go           ← entrypoint: escuta em UDS (SOCKET_PATH) ou TCP (PORT)
 internal/
   domain/
     fraud.go          ← entidades (FraudInput, FraudResult) e interface FraudScorer
@@ -126,6 +148,8 @@ make dev
 ```
 
 O [Air](https://github.com/air-verse/air) monitora alterações nos arquivos `.go` e recompila automaticamente. A API fica disponível em `http://localhost:9999`.
+
+O servidor cria o socket em `SOCKET_PATH` ao iniciar. Ao recompilar, o Air mata o processo anterior e sobe um novo; o `os.Remove` no startup remove o arquivo de socket antigo antes de criar o novo, garantindo que recompilações não falhem por "address already in use".
 
 ### Derrubando o ambiente dev
 

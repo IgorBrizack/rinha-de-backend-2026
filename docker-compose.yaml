@@ -3,6 +3,7 @@ services:
     image: nginx:1.27-alpine
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/run/sockets
     ports:
       - "9999:9999"
     depends_on:
@@ -16,16 +17,18 @@ services:
       resources:
         limits:
           cpus: "0.1"
-          memory: "50MB"
+          memory: "20MB"
 
   api1:
     build: .
     environment:
-      - PORT=8080
+      - SOCKET_PATH=/run/sockets/api1.sock
+    volumes:
+      - sockets:/run/sockets
     networks:
       - rinha-network
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
+      test: ["CMD", "curl", "-sf", "--unix-socket", "/run/sockets/api1.sock", "http://localhost/ready"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -34,16 +37,18 @@ services:
       resources:
         limits:
           cpus: "0.45"
-          memory: "150MB"
+          memory: "165MB"
 
   api2:
     build: .
     environment:
-      - PORT=8080
+      - SOCKET_PATH=/run/sockets/api2.sock
+    volumes:
+      - sockets:/run/sockets
     networks:
       - rinha-network
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
+      test: ["CMD", "curl", "-sf", "--unix-socket", "/run/sockets/api2.sock", "http://localhost/ready"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -52,7 +57,10 @@ services:
       resources:
         limits:
           cpus: "0.45"
-          memory: "150MB"
+          memory: "165MB"
+
+volumes:
+  sockets:
 
 networks:
   rinha-network:
