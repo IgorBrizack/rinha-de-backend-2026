@@ -50,12 +50,20 @@ run: build ## Compila e executa localmente (PORT=8080)
 # ─── Qualidade ────────────────────────────────────────────────────────────────
 
 .PHONY: test
-test: ## Executa os testes
+test: ## Executa os testes unitários Go
 	go test ./...
 
 .PHONY: vet
 vet: ## Executa go vet
 	go vet ./...
+
+.PHONY: k6
+k6: ## Executa o cenário K6 contra BASE_URL (padrão: http://localhost:9999)
+	k6 run $(if $(BASE_URL),--env BASE_URL=$(BASE_URL),) test/k6/scenario.js
+
+.PHONY: k6-prod
+k6-prod: ## Executa K6 contra o ambiente de produção local (docker compose up primeiro)
+	BASE_URL=http://localhost:9999 $(MAKE) k6
 
 # ─── Ajuda ────────────────────────────────────────────────────────────────────
 
