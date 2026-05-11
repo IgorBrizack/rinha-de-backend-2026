@@ -1,0 +1,8 @@
+{
+  "id": "igorbrizack-go",
+  "nome": "Igor Brizack",
+  "github": "IgorBrizack",
+  "linguagem": "Go",
+  "framework": "net/http (stdlib)",
+  "observacoes": "KNN k=5 com dataset quantizado i16, brute-force scan, Unix Domain Sockets, zero dependências externas"
+}
