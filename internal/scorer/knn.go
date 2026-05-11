@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
+	"sync"
 
 	"github.com/IgorBrizack/rinha-de-backend-2026/internal/domain"
 )
@@ -15,13 +17,13 @@ const (
 	fraudThreshold = 0.6
 )
 
-// KNN implements fraud scoring using k-nearest neighbours (k=5) over a
-// precomputed i16-quantised reference dataset.
 type KNN struct {
-	vectors []int16
-	labels  []uint8
-	count   int
-	mccRisk map[string]float64
+	vectors  []int16
+	labels   []uint8
+	count    int
+	mccRisk  map[string]float64
+	sem      chan struct{} // capacity=1: serialises KNN searches to prevent CPU thrashing
+	nWorkers int
 }
 
 // NewKNN loads the binary reference dataset and the MCC-risk map.
@@ -59,11 +61,17 @@ func NewKNN(dataPath, mccRiskPath string) (*KNN, error) {
 		return nil, fmt.Errorf("load mcc_risk: %w", err)
 	}
 
+	nWorkers := runtime.GOMAXPROCS(0)
+	sem := make(chan struct{}, 1)
+	sem <- struct{}{}
+
 	return &KNN{
-		vectors: vectors,
-		labels:  labels,
-		count:   count,
-		mccRisk: mccRisk,
+		vectors:  vectors,
+		labels:   labels,
+		count:    count,
+		mccRisk:  mccRisk,
+		sem:      sem,
+		nWorkers: nWorkers,
 	}, nil
 }
 
@@ -78,19 +86,91 @@ func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
 	query := Vectorize(input, k.mccRisk)
 	qi16 := quantizeVec(query)
 
-	// Maintain the k nearest neighbours using a bounded max-heap (worst-out policy).
-	heap := [kNeighbors]neighbor{}
-	worstIdx := 0
-	heapFull := false
-	worstDist := int64(math.MaxInt64)
+	// Acquire slot: at most 1 concurrent KNN search per instance.
+	// Other requests block here (not burning CPU) until the slot is free.
+	<-k.sem
+	defer func() { k.sem <- struct{}{} }()
 
-	for i := 0; i < k.count; i++ {
+	type chunkResult struct {
+		heap  [kNeighbors]neighbor
+		count int
+	}
+
+	chunkSize := (k.count + k.nWorkers - 1) / k.nWorkers
+	results := make([]chunkResult, k.nWorkers)
+
+	var wg sync.WaitGroup
+	for w := 0; w < k.nWorkers; w++ {
+		start := w * chunkSize
+		if start >= k.count {
+			break
+		}
+		end := min(start+chunkSize, k.count)
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			results[w].heap, results[w].count = k.searchRange(qi16, start, end)
+		}(w, start, end)
+	}
+	wg.Wait()
+
+	// Merge per-chunk heaps into global top-k.
+	final := [kNeighbors]neighbor{}
+	finalFull := false
+	worstIdx := 0
+	worstDist := int64(math.MaxInt64)
+	filled := 0
+
+	for _, r := range results {
+		for i := 0; i < r.count; i++ {
+			nb := r.heap[i]
+			if !finalFull {
+				final[filled] = nb
+				filled++
+				if filled == kNeighbors {
+					finalFull = true
+					worstIdx, worstDist = heapWorst(final[:])
+				}
+				continue
+			}
+			if nb.dist < worstDist {
+				final[worstIdx] = nb
+				worstIdx, worstDist = heapWorst(final[:])
+			}
+		}
+	}
+
+	limit := filled
+	fraudCount := 0
+	for i := 0; i < limit; i++ {
+		if final[i].label == 1 {
+			fraudCount++
+		}
+	}
+
+	fraudScore := float64(fraudCount) / float64(kNeighbors)
+	return domain.FraudResult{
+		Approved:   fraudScore < fraudThreshold,
+		FraudScore: fraudScore,
+	}
+}
+
+// searchRange scans vectors[start:end] and returns the local k-nearest heap.
+func (k *KNN) searchRange(qi16 [14]int16, start, end int) ([kNeighbors]neighbor, int) {
+	heap := [kNeighbors]neighbor{}
+	heapFull := false
+	worstIdx := 0
+	worstDist := int64(math.MaxInt64)
+	filled := 0
+
+	for i := start; i < end; i++ {
 		ref := k.vectors[i*14 : i*14+14]
 		d := sqDist(qi16[:], ref)
 
 		if !heapFull {
-			heap[i] = neighbor{d, k.labels[i]}
-			if i == kNeighbors-1 {
+			heap[filled] = neighbor{d, k.labels[i]}
+			filled++
+			if filled == kNeighbors {
 				heapFull = true
 				worstIdx, worstDist = heapWorst(heap[:])
 			}
@@ -103,22 +183,7 @@ func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
 		}
 	}
 
-	limit := kNeighbors
-	if k.count < kNeighbors {
-		limit = k.count
-	}
-	fraudCount := 0
-	for i := 0; i < limit; i++ {
-		if heap[i].label == 1 {
-			fraudCount++
-		}
-	}
-
-	fraudScore := float64(fraudCount) / float64(kNeighbors)
-	return domain.FraudResult{
-		Approved:   fraudScore < fraudThreshold,
-		FraudScore: fraudScore,
-	}
+	return heap, filled
 }
 
 // heapWorst returns the index and distance of the farthest neighbour in the heap.

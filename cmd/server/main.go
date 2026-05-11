@@ -5,12 +5,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 
 	"github.com/IgorBrizack/rinha-de-backend-2026/internal/handler"
 	"github.com/IgorBrizack/rinha-de-backend-2026/internal/scorer"
 )
 
 func main() {
+	runtime.GOMAXPROCS(2)
+
 	dataPath := getenv("DATASET_PATH", "/app/data/references.bin")
 	mccPath := getenv("MCC_RISK_PATH", "/app/data/mcc_risk.json")
 
