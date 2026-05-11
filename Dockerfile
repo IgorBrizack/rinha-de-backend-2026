@@ -21,8 +21,8 @@ RUN curl -fL "https://github.com/zanfranceschi/rinha-de-backend-2026/raw/refs/he
     curl -fL "https://github.com/zanfranceschi/rinha-de-backend-2026/raw/refs/heads/main/resources/mcc_risk.json" \
         -o /data/mcc_risk.json
 
-# Quantize and convert to i16 binary format (~87 MB output)
-RUN /preprocess/preprocess -input /tmp/references.json.gz -output /data/references.bin && \
+# Quantize, convert to i16 binary format, and sample 100K representative vectors (~2.9 MB output)
+RUN /preprocess/preprocess -input /tmp/references.json.gz -output /data/references.bin -max-samples 100000 && \
     rm /tmp/references.json.gz
 
 # ---- Stage 1: Build server ----

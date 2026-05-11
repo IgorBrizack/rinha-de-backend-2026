@@ -9,7 +9,9 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"os"
+	"sort"
 )
 
 type record struct {
@@ -18,12 +20,13 @@ type record struct {
 }
 
 func main() {
-	input := flag.String("input", "", "path to references.json.gz")
-	output := flag.String("output", "", "path to output binary file")
+	input      := flag.String("input", "", "path to references.json.gz")
+	output     := flag.String("output", "", "path to output binary file")
+	maxSamples := flag.Int("max-samples", 0, "random sample size (0 = keep all)")
 	flag.Parse()
 
 	if *input == "" || *output == "" {
-		log.Fatal("usage: preprocess -input <file.json.gz> -output <file.bin>")
+		log.Fatal("usage: preprocess -input <file.json.gz> -output <file.bin> [-max-samples N]")
 	}
 
 	f, err := os.Open(*input)
@@ -88,6 +91,32 @@ func main() {
 		if count%500_000 == 0 {
 			log.Printf("processed %d records...", count)
 		}
+	}
+
+	// Optionally subsample while preserving class distribution.
+	if *maxSamples > 0 && count > uint32(*maxSamples) {
+		originalCount := count
+		rng := rand.New(rand.NewSource(42))
+		indices := make([]int, int(count))
+		for i := range indices {
+			indices[i] = i
+		}
+		rng.Shuffle(len(indices), func(i, j int) {
+			indices[i], indices[j] = indices[j], indices[i]
+		})
+		indices = indices[:*maxSamples]
+		sort.Ints(indices) // sort for sequential memory access
+
+		newVectors := make([]int16, *maxSamples*14)
+		newLabels := make([]uint8, *maxSamples)
+		for i, idx := range indices {
+			copy(newVectors[i*14:], vectors[idx*14:idx*14+14])
+			newLabels[i] = labels[idx]
+		}
+		vectors = newVectors
+		labels = newLabels
+		count = uint32(*maxSamples)
+		log.Printf("sampled %d records from %d", count, originalCount)
 	}
 
 	out, err := os.Create(*output)
