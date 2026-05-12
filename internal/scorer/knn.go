@@ -15,6 +15,7 @@ import (
 const (
 	kNeighbors     = 5
 	fraudThreshold = 0.6
+	nProbe         = 16 // IVF: clusters to probe per query
 )
 
 type KNN struct {
@@ -22,12 +23,23 @@ type KNN struct {
 	labels   []uint8
 	count    int
 	mccRisk  map[string]float64
-	sem      chan struct{} // capacity=1: serialises KNN searches to prevent CPU thrashing
+
+	// IVF index (populated when binary was built with -ivf-k > 0)
+	centroids      []int16
+	clusterOffsets []uint32
+	ivfK           int
+
+	// Flat brute-force concurrency (only used when ivfK == 0)
+	sem      chan struct{}
 	nWorkers int
 }
 
 // NewKNN loads the binary reference dataset and the MCC-risk map.
-// Binary layout: [count uint32 LE][dims uint32 LE][vectors flat i16][labels bytes]
+//
+// Supports two binary layouts:
+//
+//	v1 (legacy):  [count u32][dims u32][vectors flat i16][labels bytes]
+//	v2 (IVF):     [count u32][dims u32][K u32][K×14 centroids i16][(K+1) offsets u32][vectors sorted by cluster][labels]
 func NewKNN(dataPath, mccRiskPath string) (*KNN, error) {
 	data, err := os.ReadFile(dataPath)
 	if err != nil {
@@ -43,13 +55,51 @@ func NewKNN(dataPath, mccRiskPath string) (*KNN, error) {
 		return nil, fmt.Errorf("expected 14 dims, got %d", dims)
 	}
 
-	vectorBytes := count * dims * 2
-	labelOffset := 8 + vectorBytes
-	if len(data) < labelOffset+count {
-		return nil, fmt.Errorf("dataset truncated")
+	// Detect v1 vs v2 by expected file size.
+	v1Size := 8 + count*dims*2 + count
+	K := 0
+	offset := 8
+
+	if len(data) != v1Size {
+		if len(data) < 12 {
+			return nil, fmt.Errorf("dataset truncated (header)")
+		}
+		K = int(binary.LittleEndian.Uint32(data[8:12]))
+		offset = 12
 	}
 
-	raw := data[8 : 8+vectorBytes]
+	var centroids []int16
+	var clusterOffsets []uint32
+
+	if K > 0 {
+		centBytes := K * dims * 2
+		if len(data) < offset+centBytes {
+			return nil, fmt.Errorf("dataset truncated (centroids)")
+		}
+		centroids = make([]int16, K*dims)
+		for i := range centroids {
+			centroids[i] = int16(binary.LittleEndian.Uint16(data[offset+i*2:]))
+		}
+		offset += centBytes
+
+		offBytes := (K + 1) * 4
+		if len(data) < offset+offBytes {
+			return nil, fmt.Errorf("dataset truncated (offsets)")
+		}
+		clusterOffsets = make([]uint32, K+1)
+		for i := range clusterOffsets {
+			clusterOffsets[i] = binary.LittleEndian.Uint32(data[offset+i*4:])
+		}
+		offset += offBytes
+	}
+
+	vectorBytes := count * dims * 2
+	labelOffset := offset + vectorBytes
+	if len(data) < labelOffset+count {
+		return nil, fmt.Errorf("dataset truncated (vectors/labels)")
+	}
+
+	raw := data[offset : offset+vectorBytes]
 	vectors := make([]int16, count*dims)
 	for i := range vectors {
 		vectors[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
@@ -61,18 +111,24 @@ func NewKNN(dataPath, mccRiskPath string) (*KNN, error) {
 		return nil, fmt.Errorf("load mcc_risk: %w", err)
 	}
 
-	nWorkers := runtime.GOMAXPROCS(0)
-	sem := make(chan struct{}, 1)
-	sem <- struct{}{}
+	knn := &KNN{
+		vectors:        vectors,
+		labels:         labels,
+		count:          count,
+		mccRisk:        mccRisk,
+		centroids:      centroids,
+		clusterOffsets: clusterOffsets,
+		ivfK:           K,
+	}
 
-	return &KNN{
-		vectors:  vectors,
-		labels:   labels,
-		count:    count,
-		mccRisk:  mccRisk,
-		sem:      sem,
-		nWorkers: nWorkers,
-	}, nil
+	if K == 0 {
+		knn.nWorkers = runtime.GOMAXPROCS(0)
+		sem := make(chan struct{}, 1)
+		sem <- struct{}{}
+		knn.sem = sem
+	}
+
+	return knn, nil
 }
 
 type neighbor struct {
@@ -86,8 +142,84 @@ func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
 	query := Vectorize(input, k.mccRisk)
 	qi16 := quantizeVec(query)
 
-	// Acquire slot: at most 1 concurrent KNN search per instance.
-	// Other requests block here (not burning CPU) until the slot is free.
+	var heap [kNeighbors]neighbor
+	var filled int
+
+	if k.ivfK > 0 {
+		heap, filled = k.ivfSearch(qi16)
+	} else {
+		heap, filled = k.flatSearch(qi16)
+	}
+
+	fraudCount := 0
+	for i := 0; i < filled; i++ {
+		if heap[i].label == 1 {
+			fraudCount++
+		}
+	}
+	fraudScore := float64(fraudCount) / float64(kNeighbors)
+	return domain.FraudResult{
+		Approved:   fraudScore < fraudThreshold,
+		FraudScore: fraudScore,
+	}
+}
+
+// ivfSearch finds k-nearest neighbours using the precomputed IVF index.
+// Scans only nProbe clusters instead of the full dataset.
+func (k *KNN) ivfSearch(qi16 [14]int16) ([kNeighbors]neighbor, int) {
+	type centDist struct {
+		dist int64
+		idx  int
+	}
+	cd := make([]centDist, k.ivfK)
+	for c := 0; c < k.ivfK; c++ {
+		cd[c] = centDist{sqDist(qi16[:], k.centroids[c*14:c*14+14]), c}
+	}
+
+	// Partial selection sort: move top nProbe to the front (O(K × nProbe)).
+	np := min(nProbe, k.ivfK)
+	for p := 0; p < np; p++ {
+		best := p
+		for i := p + 1; i < k.ivfK; i++ {
+			if cd[i].dist < cd[best].dist {
+				best = i
+			}
+		}
+		cd[p], cd[best] = cd[best], cd[p]
+	}
+
+	heap := [kNeighbors]neighbor{}
+	heapFull := false
+	worstIdx := 0
+	worstDist := int64(math.MaxInt64)
+	filled := 0
+
+	for p := 0; p < np; p++ {
+		c := cd[p].idx
+		start := int(k.clusterOffsets[c])
+		end := int(k.clusterOffsets[c+1])
+		for i := start; i < end; i++ {
+			d := sqDist(qi16[:], k.vectors[i*14:i*14+14])
+			if !heapFull {
+				heap[filled] = neighbor{d, k.labels[i]}
+				filled++
+				if filled == kNeighbors {
+					heapFull = true
+					worstIdx, worstDist = heapWorst(heap[:])
+				}
+				continue
+			}
+			if d < worstDist {
+				heap[worstIdx] = neighbor{d, k.labels[i]}
+				worstIdx, worstDist = heapWorst(heap[:])
+			}
+		}
+	}
+	return heap, filled
+}
+
+// flatSearch is the legacy parallel brute-force path (used when ivfK == 0).
+func (k *KNN) flatSearch(qi16 [14]int16) ([kNeighbors]neighbor, int) {
 	<-k.sem
 	defer func() { k.sem <- struct{}{} }()
 
@@ -114,7 +246,6 @@ func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
 	}
 	wg.Wait()
 
-	// Merge per-chunk heaps into global top-k.
 	final := [kNeighbors]neighbor{}
 	finalFull := false
 	worstIdx := 0
@@ -139,20 +270,7 @@ func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
 			}
 		}
 	}
-
-	limit := filled
-	fraudCount := 0
-	for i := 0; i < limit; i++ {
-		if final[i].label == 1 {
-			fraudCount++
-		}
-	}
-
-	fraudScore := float64(fraudCount) / float64(kNeighbors)
-	return domain.FraudResult{
-		Approved:   fraudScore < fraudThreshold,
-		FraudScore: fraudScore,
-	}
+	return final, filled
 }
 
 // searchRange scans vectors[start:end] and returns the local k-nearest heap.
