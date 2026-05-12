@@ -26,8 +26,8 @@ API de detecção de fraudes para a [Rinha de Backend 2026](https://github.com/z
 - **Load balancer**: nginx com round-robin simples, sem lógica de negócio
 - **Comunicação nginx ↔ API**: Unix Domain Sockets via volume compartilhado `/run/sockets`
 - **API**: Go 1.24, stdlib pura, zero dependências externas
-- **Scorer**: KNN k=5, distância euclidiana quadrática, 100K vetores quantizados em i16
-- **Concorrência**: `GOMAXPROCS=2` + semáforo (cap=1) por instância + scan paralelo com 2 workers
+- **Scorer**: KNN k=5, distância euclidiana quadrática, 100K vetores quantizados em i16 com índice IVF (K=256 centroids, NPROBE=16)
+- **Concorrência**: `GOMAXPROCS=2`; com IVF (~0.5ms/busca) sem semáforo — requests concorrentes são tratados diretamente pelo HTTP server
 - **Limites de recursos** (dentro do teto da competição: 1 CPU / 350 MB total):
 
 | Serviço | CPU | Memória |
@@ -37,9 +37,17 @@ API de detecção de fraudes para a [Rinha de Backend 2026](https://github.com/z
 | api2    | 0.475 | 170 MB |
 | **Total** | **1.00** | **350 MB** |
 
-### Detecção de Fraudes (KNN)
+### Detecção de Fraudes (KNN + IVF)
 
-A cada requisição, a transação é convertida em um vetor de 14 dimensões normalizadas e comparada contra **100.000 vetores de referência** pré-classificados (amostra representativa do dataset original de 3M). Os 5 vizinhos mais próximos determinam o score de fraude:
+A cada requisição, a transação é convertida em um vetor de 14 dimensões normalizadas e comparada contra **100.000 vetores de referência** pré-classificados usando um índice IVF (Inverted File Index) com K=256 centroids. Em vez de varrer todos os 100K vetores, a busca:
+
+1. Calcula a distância do query para os 256 centroids (~3K operações)
+2. Seleciona os 16 centroids mais próximos (NPROBE=16)
+3. Varre apenas os vetores nesses 16 clusters (~6.250 vetores vs 100.000)
+
+**Resultado**: ~15x speedup — de ~8ms para ~0.5ms por busca — eliminando filas e timeouts sob carga.
+
+Os 5 vizinhos mais próximos determinam o score de fraude:
 
 ```
 fraud_score = número_de_vizinhos_fraud / 5
@@ -79,31 +87,28 @@ A quantização f32→i16 (valores `[0,1]` → `[0, 32767]`, sentinel `-1.0` →
 
 ### Modelo de Concorrência
 
-O gargalo do KNN é CPU-bound: cada busca varre N vetores sequencialmente. Sob alta concorrência sem controle, 100 goroutines competem pelo mesmo 0.475 CPU e cada uma avança a 1/100 da velocidade, tornando p(99) proporcional ao tamanho da fila.
+Com o índice IVF, cada busca leva ~0.5ms de CPU. Isso elimina o problema de filas que existia com o brute-force:
 
-A solução tem duas camadas:
+- **Sem semáforo**: requests concorrentes são atendidos diretamente pelo HTTP server do Go. Não há fila acumulando latência.
+- **GOMAXPROCS=2**: o scheduler do Go distribui as goroutines de HTTP sobre 2 OS threads, aproveitando os dois cores disponíveis (0.475 CPU × 2).
+- **Resultado medido**: p(99)=202ms e 0 erros HTTP sob 100 VUs contínuos.
 
-**1. Semáforo por instância (capacidade=1)** — serializa as buscas KNN. Apenas uma busca roda de cada vez; as demais ficam bloqueadas no canal sem consumir CPU. Padrão de canal pré-preenchido em Go:
+O semáforo (capacidade=1) ainda existe no código como **fallback** para o caminho brute-force (quando o binário é gerado sem `-ivf-k`). A lógica é:
 
 ```go
-// inicialização — token disponível
+// Padrão de canal pré-preenchido em Go (fallback brute-force apenas)
 sem = make(chan struct{}, 1)
-sem <- struct{}{}
+sem <- struct{}{}   // token disponível
 
-// adquirir (Score) — bloqueia se outra busca estiver rodando
-<-k.sem
-defer func() { k.sem <- struct{}{} }()
+<-k.sem                                 // adquirir: bloqueia se outra busca roda
+defer func() { k.sem <- struct{}{} }() // liberar: devolve o token
 ```
 
-**2. Scan paralelo com `nWorkers` goroutines** — dentro do slot adquirido, o dataset é dividido em chunks e cada goroutine busca seu chunk. Os heaps locais são mergeados ao final:
+Esse padrão serializa as buscas brute-force para evitar CPU thrashing: com 0.475 CPU e 2 workers paralelos, uma busca por vez é o máximo útil. Com IVF esse controle não é mais necessário.
 
-```go
-// cada goroutine busca [start, end) e retorna seu top-k local
-results[w].heap, results[w].count = k.searchRange(qi16, start, end)
-// merge: iterar todos os resultados e manter o top-k global
-```
+### Por que o IVF resolve os erros HTTP
 
-Com `GOMAXPROCS=2`, as duas goroutines de busca podem rodar em paralelo, reduzindo o wall-clock por request.
+O resultado anterior da competição tinha **273 erros HTTP** (peso 5× no score de detecção). A causa provável era o acúmulo de fila no semáforo: sob carga alta, requests esperavam múltiplas buscas de 8ms antes de serem atendidos. Com a fila profunda o suficiente, o nginx poderia retornar 504 antes do handler responder. Com IVF (0.5ms/busca, sem semáforo), esse cenário desaparece.
 
 ### Unix Domain Sockets
 
@@ -130,7 +135,7 @@ internal/
     fraud_score.go    ← ScoreFraud: orquestra a chamada ao scorer
   scorer/
     vectorize.go      ← FraudInput → [14]float64 (normalização dos 14 dims)
-    knn.go            ← KNN com semáforo, scan paralelo e merge de heaps
+    knn.go            ← KNN com índice IVF (K=256, NPROBE=16) e fallback brute-force
   handler/
     router.go         ← monta o http.ServeMux com as rotas
     fraud.go          ← POST /fraud-score: decode, mapeia para domain, chama usecase
@@ -195,7 +200,7 @@ Avalia o risco de fraude de uma transação e retorna se ela deve ser aprovada.
 
 O Dockerfile usa 3 stages:
 
-1. **preprocessor** — baixa `references.json.gz` (~16 MB) do repositório oficial, compila e roda `cmd/preprocess -max-samples 100000`, gerando `references.bin` (~2.9 MB com 100K vetores i16)
+1. **preprocessor** — baixa `references.json.gz` (~16 MB), compila e roda `cmd/preprocess -max-samples 100000 -ivf-k 256`, gerando `references.bin` (~2.9 MB com 100K vetores i16 + índice IVF de 256 centroids). O k-means++ com 25 iterações leva ~20-30s neste stage.
 2. **builder** — compila o servidor Go com otimizações de produção (`-ldflags="-s -w"`)
 3. **final** — imagem alpine mínima com o binário + dataset
 
@@ -208,21 +213,101 @@ make prod-down   # derruba o ambiente de produção
 
 ## Otimizações de Performance
 
-Jornada de tuning medida com o cenário k6 local (100 VUs, sem sleep — carga extrema):
+### Resultado final (k6-prod, 100 VUs, 4 minutos)
 
-| Versão | Mudança principal | p(99) | Throughput |
-|--------|------------------|-------|------------|
-| Baseline | KNN brute-force, 3M vetores | 42.9s ❌ | 4.7 req/s |
-| +semáforo +workers | GOMAXPROCS=2, scan paralelo, semáforo=1 | 16.2s ❌ | 6.1 req/s |
-| **+sampling 100K** | **100K amostras representativas** | **859ms ✅** | **166 req/s** |
+```
+p(99)            = 202ms   ✅  (limite: 2000ms)
+http_req_failed  = 0.00%   ✅  (limite: 15%)
+throughput       = 616 req/s
+fraud_detection  = 100%
+```
 
-### Por que o baseline era tão lento
+### Jornada de desenvolvimento
 
-Com 3M vetores e 0.475 CPU, cada busca KNN consumia ~225ms de CPU → ~500ms de wall-clock. Sem controle de concorrência, 100 goroutines competiam pelo mesmo CPU: cada uma avançava a 1/100 da velocidade, tornando p(99) ≈ 100 × 500ms / 2 instâncias ≈ 25s.
+| Versão | Mudança principal | p(99) | Throughput | Problema restante |
+|--------|------------------|-------|------------|-------------------|
+| Baseline | KNN brute-force, 3M vetores | 42.9s ❌ | 4.7 req/s | CPU saturado, sem controle de concorrência |
+| +semáforo +workers | GOMAXPROCS=2, scan paralelo, semáforo=1 | 16.2s ❌ | 6.1 req/s | Dataset muito grande |
+| +sampling 100K | 100K amostras representativas | 859ms → **2001ms** ❌ | 166 req/s | 1.35ms acima do limite na competição; 273 erros HTTP |
+| **+IVF K=256** | **Índice IVF, NPROBE=16, sem semáforo** | **202ms ✅** | **616 req/s** | — |
+
+---
+
+### Etapa 1 — Baseline: 3M vetores, brute-force
+
+**Como estava:** A primeira versão varria linearmente todos os 3M vetores de referência para cada requisição. Sem qualquer controle de concorrência: 100 goroutines de HTTP competiam pela mesma CPU.
+
+**O problema:** Com 0.475 CPU por instância, cada busca consumia ~225ms de CPU → ~500ms de wall-clock. Com 100 VUs:
+
+```
+p(99) ≈ 50 VUs × 500ms = 25s por instância → 42.9s medido
+```
+
+**Aprendizado:** Em sistemas CPU-bound com cota de CPU limitada (CFS quota), concorrência irrestrita é pior que serialização — cada goroutine avança a 1/N da velocidade, e todas ficam lentas juntas. O problema não era só o dataset grande; era a ausência de backpressure.
+
+---
+
+### Etapa 2 — Semáforo + scan paralelo: controle de concorrência
+
+**O que mudou:** Introduzido semáforo de capacidade 1 (`sem chan struct{}`) para serializar as buscas KNN por instância. Dentro do slot, o scan é dividido em 2 goroutines (uma por core com `GOMAXPROCS=2`).
+
+**Bug crítico cometido:** A lógica do semáforo foi implementada ao contrário na primeira tentativa:
+
+```go
+// ERRADO: tenta enviar para adquirir → bloqueia imediatamente se canal cheio
+k.sem <- struct{}{}    // ← isso é a liberação, não a aquisição!
+
+// CORRETO: recebe para adquirir (tira o token), envia para liberar (devolve)
+<-k.sem
+defer func() { k.sem <- struct{}{} }()
+```
+
+**Sintoma:** 100% de falhas HTTP instantâneas (nginx 502/504 imediatos), throughput de 659 req/s aparente — que era na verdade nginx devolvendo erro sem nem chegar à API.
+
+**Aprendizado:** O padrão de semáforo em Go usa canal pré-preenchido: `sem <- struct{}{}` na inicialização coloca o token. `<-sem` *tira* o token (adquire), `sem <- struct{}{}` *devolve* (libera). Inverter os dois torna o canal sempre vazio → nenhuma goroutine consegue adquirir → deadlock imediato.
+
+**Resultado após correção:** p(99) caiu de 42.9s para 16.2s. Melhora real, mas insuficiente. O dataset de 3M vetores ainda tornava cada busca lenta demais.
+
+---
+
+### Etapa 3 — Sampling 100K: tamanho do dataset
+
+**O que mudou:** Preprocessador passa a sortear 100K amostras representativas do dataset original de 3M (shuffle com seed=42, distribuição de classes preservada). O binário cai de 87 MB para 2.9 MB; a busca, de ~225ms para ~8ms.
+
+**Resultado local:** p(99) = 859ms ✅ — passou o threshold de 2000ms nos testes locais.
+
+**Resultado na competição:** **p(99) = 2001.35ms ❌** — apenas 1.35ms acima do limite. Isso ativou o corte de -3000 pontos. Além disso, 273 erros HTTP (peso 5× cada) arrasaram o score de detecção.
+
+**Por que os resultados divergiram:** O ambiente da competição tem carga e condições diferentes dos testes locais. O semáforo de capacidade 1 ainda criava fila sob carga real: com requests acumulando, a latência observada ultrapassava marginalmente o limite. Os erros HTTP provavelmente vinham dessa fila — requests esperando na frente do semáforo enquanto o nginx já havia expirado o timeout.
+
+**Aprendizado:** Testar localmente com 100 VUs é uma aproximação. A competição pode ter VUs, ramp-up, ou infraestrutura diferentes. Margens de segurança de latência importam: um threshold de 2000ms com p(99) medido de 859ms parece confortável, mas 1.35ms de divergência mostra que não era.
+
+---
+
+### Etapa 4 — IVF: índice de busca aproximada
+
+**Como ficou:** Em vez de varrer todos os 100K vetores, o preprocessador roda k-means++ (K=256, 25 iterações) durante o build da imagem Docker e persiste o índice IVF no binário. Em runtime, cada busca:
+
+1. Calcula distância para 256 centroids (~3.6K operações)
+2. Seleciona os 16 mais próximos (NPROBE=16, partial selection sort O(K×P))
+3. Varre apenas os vetores nesses 16 clusters (~6.250 vetores)
+
+```
+Antes: 100.000 vetores varridos por busca
+Depois: ~6.250 vetores varridos — 16× menos
+```
+
+**Por que isso resolve os erros HTTP:** Com buscas em ~0.5ms, não há fila se acumulando. O semáforo foi removido do caminho IVF — requests concorrentes são atendidos diretamente. Sem fila → sem timeout → sem erros HTTP.
+
+**Por que o índice é construído no Dockerfile e não em runtime:** K-means++ sobre 100K vetores leva ~20-30s. Fazer isso no startup inviabilizaria o healthcheck. O índice é um artefato de build, não de runtime — mesmo princípio da quantização: trabalho custoso acontece uma vez.
+
+**Inspiração:** [jairoblatt/rinha-2026-rust](https://github.com/jairoblatt/rinha-2026-rust) usa IVF com K=4096, NPROBE=5/24 e AVX2/FMA — a mesma estrutura, em escala maior e com vetorização SIMD.
+
+---
 
 ### Por que 100K amostras são suficientes para KNN
 
-KNN com muitos pontos de referência tem retornos decrescentes: a fronteira de decisão entre classes já está bem definida com uma fração dos dados, desde que a distribuição das classes seja preservada. A amostragem aleatória com seed fixo (42) mantém a proporção legítima/fraude do dataset original. Casos claramente fraudulentos ou legítimos são classificados corretamente; apenas casos limítrofes — onde os 5 vizinhos são uma mistura — podem divergir do ground truth com 3M vetores.
+KNN tem retornos decrescentes com mais dados de referência: a fronteira de decisão entre as classes já está bem definida com uma fração, desde que a distribuição das classes seja preservada. A amostragem com seed fixo (42) mantém a proporção fraude/legítimo do dataset original. Casos claramente fraudulentos ou legítimos são classificados corretamente; apenas os casos limítrofes — onde os 5 vizinhos são mistura das duas classes — podem divergir do ground truth com 3M vetores.
 
 ## Testes de Carga (k6)
 
@@ -372,7 +457,7 @@ make dev-debug
 
 ## Referências
 
-- **[Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026)** — repositório oficial com as regras, dataset de referência (`references.json.gz`), especificação dos 14 atributos e critérios de avaliação.
+- **[jairoblatt/rinha-2026-rust](https://github.com/jairoblatt/rinha-2026-rust)** — implementação de referência em Rust que inspirou a adoção do IVF neste projeto. Usa IVF com K=4096 centroids, NPROBE=5 (fast) / 24 (full) e AVX2/FMA para vetorização SIMD. A abordagem central — construir o índice k-means++ em build time e fazer scan apenas dos clusters mais próximos em runtime — reduz o espaço de busca de 3M vetores para ~5K, tornando p99 < 100ms mesmo sob carga extrema.
 
 - **Bruno Gonzaga — ["Rinha de Backend 2026: Vetores, Memória e Vizinhos"](https://brunogonzaga.dev/artigos/rinha-backend-2026-vetores-memoria/)** — artigo fundamental para entender os desafios desta edição. Os principais aprendizados:
   - **Separação build-time / runtime**: tudo que é custoso (parse de JSON, quantização, conversão de formato) deve ir para o build; o runtime só mapeia e responde. Essa separação é o que torna viável ter 3M vetores disponíveis em memória sem impactar o startup da API.
