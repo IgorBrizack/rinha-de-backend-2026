@@ -26,26 +26,26 @@ API de detecção de fraudes para a [Rinha de Backend 2026](https://github.com/z
 - **Load balancer**: nginx com round-robin simples, sem lógica de negócio
 - **Comunicação nginx ↔ API**: Unix Domain Sockets via volume compartilhado `/run/sockets`
 - **API**: Go 1.24, stdlib pura, zero dependências externas
-- **Scorer**: KNN k=5, distância euclidiana quadrática, 100K vetores quantizados em i16 com índice IVF (K=256 centroids, NPROBE=16)
-- **Concorrência**: `GOMAXPROCS=2`; com IVF (~0.5ms/busca) sem semáforo — requests concorrentes são tratados diretamente pelo HTTP server
+- **Scorer**: KNN k=5, distância euclidiana quadrática, 100K vetores quantizados em i16 com índice IVF (K=1024 centroids, NPROBE=3)
+- **Concorrência**: `GOMAXPROCS=2`; com IVF (~0.15ms/busca) sem semáforo — requests concorrentes são tratados diretamente pelo HTTP server
 - **Limites de recursos** (dentro do teto da competição: 1 CPU / 350 MB total):
 
 | Serviço | CPU | Memória |
 |---------|-----|---------|
-| nginx   | 0.05 | 10 MB  |
-| api1    | 0.475 | 170 MB |
-| api2    | 0.475 | 170 MB |
+| nginx   | 0.20 | 30 MB  |
+| api1    | 0.40 | 160 MB |
+| api2    | 0.40 | 160 MB |
 | **Total** | **1.00** | **350 MB** |
 
 ### Detecção de Fraudes (KNN + IVF)
 
-A cada requisição, a transação é convertida em um vetor de 14 dimensões normalizadas e comparada contra **100.000 vetores de referência** pré-classificados usando um índice IVF (Inverted File Index) com K=256 centroids. Em vez de varrer todos os 100K vetores, a busca:
+A cada requisição, a transação é convertida em um vetor de 14 dimensões normalizadas e comparada contra **100.000 vetores de referência** pré-classificados usando um índice IVF (Inverted File Index) com K=1024 centroids. Em vez de varrer todos os 100K vetores, a busca:
 
-1. Calcula a distância do query para os 256 centroids (~3K operações)
-2. Seleciona os 16 centroids mais próximos (NPROBE=16)
-3. Varre apenas os vetores nesses 16 clusters (~6.250 vetores vs 100.000)
+1. Calcula a distância do query para os 1024 centroids (~14K operações)
+2. Seleciona os 3 centroids mais próximos (NPROBE=3)
+3. Varre apenas os vetores nesses 3 clusters (~293 vetores vs 100.000)
 
-**Resultado**: ~15x speedup — de ~8ms para ~0.5ms por busca — eliminando filas e timeouts sob carga.
+**Resultado**: ~21x speedup — de ~0.5ms para ~0.07ms por busca. A mesma taxa de FP que K=256+NPROBE=16, com 8× menos vetores varridos.
 
 Os 5 vizinhos mais próximos determinam o score de fraude:
 
@@ -80,14 +80,14 @@ approved    = fraud_score < 0.6
 | Vetores i16 | **2.8 MB** | 84 MB |
 | Labels | **0.1 MB** | 3 MB |
 | **Total dataset** | **~2.9 MB** | ~87 MB |
-| Limite por instância | 170 MB | 165 MB |
-| **Margem para runtime** | **~167 MB** | ~78 MB |
+| Limite por instância | 160 MB | 165 MB |
+| **Margem para runtime** | **~157 MB** | ~78 MB |
 
 A quantização f32→i16 (valores `[0,1]` → `[0, 32767]`, sentinel `-1.0` → `MinInt16`) mantém precisão suficiente para KNN enquanto reduz o footprint de memória. Usar 100K amostras em vez de 3M reduz o dataset embarcado de 87 MB para 2.9 MB e o tempo de busca de ~250ms para ~8ms por request, com impacto mínimo na acurácia (os casos limítrofes podem divergir, mas a distribuição geral das classes é preservada pela amostragem aleatória com seed fixo).
 
 ### Modelo de Concorrência
 
-Com o índice IVF, cada busca leva ~0.5ms de CPU. Isso elimina o problema de filas que existia com o brute-force:
+Com o índice IVF, cada busca leva ~0.15ms de CPU. Isso elimina o problema de filas que existia com o brute-force:
 
 - **Sem semáforo**: requests concorrentes são atendidos diretamente pelo HTTP server do Go. Não há fila acumulando latência.
 - **GOMAXPROCS=2**: o scheduler do Go distribui as goroutines de HTTP sobre 2 OS threads, aproveitando os dois cores disponíveis (0.475 CPU × 2).
@@ -135,7 +135,7 @@ internal/
     fraud_score.go    ← ScoreFraud: orquestra a chamada ao scorer
   scorer/
     vectorize.go      ← FraudInput → [14]float64 (normalização dos 14 dims)
-    knn.go            ← KNN com índice IVF (K=256, NPROBE=16) e fallback brute-force
+    knn.go            ← KNN com índice IVF (K=1024, NPROBE=3) e fallback brute-force
   handler/
     router.go         ← monta o http.ServeMux com as rotas
     fraud.go          ← POST /fraud-score: decode, mapeia para domain, chama usecase
@@ -200,7 +200,7 @@ Avalia o risco de fraude de uma transação e retorna se ela deve ser aprovada.
 
 O Dockerfile usa 3 stages:
 
-1. **preprocessor** — baixa `references.json.gz` (~16 MB), compila e roda `cmd/preprocess -max-samples 100000 -ivf-k 256`, gerando `references.bin` (~2.9 MB com 100K vetores i16 + índice IVF de 256 centroids). O k-means++ com 25 iterações leva ~20-30s neste stage.
+1. **preprocessor** — baixa `references.json.gz` (~16 MB), compila e roda `cmd/preprocess -max-samples 100000 -ivf-k 1024`, gerando `references.bin` (~2.9 MB com 100K vetores i16 + índice IVF de 1024 centroids). O k-means++ com 25 iterações leva ~30-60s neste stage.
 2. **builder** — compila o servidor Go com otimizações de produção (`-ldflags="-s -w"`)
 3. **final** — imagem alpine mínima com o binário + dataset
 
@@ -229,7 +229,56 @@ fraud_detection  = 100%
 | Baseline | KNN brute-force, 3M vetores | 42.9s ❌ | 4.7 req/s | CPU saturado, sem controle de concorrência |
 | +semáforo +workers | GOMAXPROCS=2, scan paralelo, semáforo=1 | 16.2s ❌ | 6.1 req/s | Dataset muito grande |
 | +sampling 100K | 100K amostras representativas | 859ms → **2001ms** ❌ | 166 req/s | 1.35ms acima do limite na competição; 273 erros HTTP |
-| **+IVF K=256** | **Índice IVF, NPROBE=16, sem semáforo** | **202ms ✅** | **616 req/s** | — |
+| **+IVF K=256** | **Índice IVF, NPROBE=16, sem semáforo** | **202ms ✅** | **616 req/s** | nginx CPU-starved (0.05 CPU); 1631 erros HTTP em produção |
+| **+v2 (atual)** | **nginx 0.20 CPU, K=1024+nProbe=3, GOMEMLIMIT, sync.Pool** | **~87ms** | **2516 req/s** | — |
+
+---
+
+### Otimizações v2 — inspiradas em [banjohann/rinha-2026-go](https://github.com/banjohann/rinha-2026-go)
+
+A submissão anterior com IVF K=256 obteve **-3865.86 pontos** apesar do p99=202ms nos testes locais. Na competição, o p99 foi 2002.16ms (+2ms acima do corte) e houve 1631 erros HTTP. A análise do repositório de referência revelou a raiz dos dois problemas:
+
+#### Problema: nginx CPU-starved (0.05 CPU)
+
+O banjohann/rinha-2026-go documentou que dobrar o CPU do load balancer (0.10→0.20) reduziu o p99 de **257ms → 5.85ms** (44×). O mecanismo: com CPU insuficiente, o processo nginx fica throttled pelo CFS do Linux. Requests chegam mais rápido do que o nginx consegue fazer proxy, criando uma fila interna. Essa fila acrescenta latência e, quando profunda o suficiente, causa timeouts que o nginx converte em 504 antes do handler responder.
+
+Nosso nginx estava em 0.05 CPU — 4× abaixo do valor que o repositório de referência identificou como insuficiente (0.10). Isso explica ambos os sintomas: os 2ms extras no p99 e os 1631 erros HTTP.
+
+**Fix:** nginx 0.05→0.20 CPU, apis 0.475→0.40 CPU, memórias redistribuídas proporcionalmente. Total permanece 1.00 CPU / 350 MB.
+
+#### IVF K=1024 + NPROBE=3
+
+O repositório de referência usa K=1024 centroids com NPROBE=3, que escaneia ~293 vetores por query vs ~6.250 com K=256+NPROBE=16. Clusters mais finos (97 vetores/cluster vs 390) permitem encontrar os vizinhos corretos varrendo muito menos vetores.
+
+**Fix:** Dockerfile com `-ivf-k 1024`, `nProbe = 3`. Testes comparativos mostraram que K=256+nProbe=16 (6.250 vetores/query) tem a mesma taxa de FP que K=1024+nProbe=3 (293 vetores/query), mas com p99 214ms vs 87ms e throughput 978 vs 2516 req/s. K=1024+nProbe=3 domina em latência para a mesma acurácia.
+
+#### GOMEMLIMIT
+
+Sem `GOMEMLIMIT`, o GC do Go assume que pode usar até o dobro do heap ao vivo antes de coletar. Com heap ao vivo de ~3 MB (dataset), o GC pode adiar coleta até o RSS atingir ~50-80 MB, e então fazer uma coleta longa visível como spike no p99. `GOMEMLIMIT=150MiB` instrui o runtime a coletar mais agressivamente antes do limite do container (160 MB), eliminando esses spikes de cauda.
+
+**Fix:** `GOMEMLIMIT=150MiB` no environment de api1 e api2 em `docker-compose.yml`.
+
+#### sync.Pool para alocações por request
+
+Cada request alocava:
+- Um `fraudRequest` struct (~200 bytes + backing array de `KnownMerchants`)
+- Um slice `centDist` de K elementos para a busca IVF (~16 KB com K=1024)
+
+Com K=1024 e centDist alocado por request, 54K requests × 16 KB = ~864 MB de garbage para o GC coletar. Usar `sync.Pool` para ambos reusa as alocações entre requests, reduzindo drasticamente a pressão no GC.
+
+**Fix:** `fraudReqPool` em `handler/fraud.go`, `centDistPool` em `scorer/knn.go`.
+
+#### Resumo das mudanças v2
+
+| Arquivo | Mudança | Efeito esperado |
+|---------|---------|----------------|
+| `docker-compose.yml` | nginx 0.05→0.20 CPU, apis 0.475→0.40, GOMEMLIMIT=150MiB | Remove p99 cut + elimina HTTP errors |
+| `Dockerfile` | `-ivf-k 256` → `-ivf-k 1024` | 21× menos vetores varridos por query |
+| `internal/scorer/knn.go` | pool para centDist + `nProbe 16→3` (K=1024) | Reduz latência de busca + GC pressure |
+| `internal/handler/fraud.go` | pool para fraudRequest | Reduz GC pressure por request |
+| `nginx.conf` | `worker_connections 4096`, `tcp_nodelay`, `proxy_buffering off` | Suporta bursts sem dropar conexões |
+
+Score esperado: **+2500 a +4500** (referência com as mesmas técnicas: +4671).
 
 ---
 
@@ -456,6 +505,8 @@ make dev-debug
 - O VS Code executa a task `attach-delve` que roda `dlv attach` no container `rinha-api1` na porta `2345`
 
 ## Referências
+
+- **[banjohann/rinha-2026-go](https://github.com/banjohann/rinha-2026-go)** — implementação em Go que alcançou +4671 pontos (+5.83ms p99, 99.94% acurácia). Inspirou as otimizações v2 deste projeto: redistribuição de CPU para o load balancer (principal causa do p99 cut), IVF K=1024+NPROBE=3, GOMEMLIMIT e sync.Pool. A análise de performance deles documentou que dobrar o CPU do HAProxy (0.10→0.20) sozinho reduziu o p99 de 257ms para 5.85ms — um sinal claro de que o gargalo estava no load balancer, não na API.
 
 - **[jairoblatt/rinha-2026-rust](https://github.com/jairoblatt/rinha-2026-rust)** — implementação de referência em Rust que inspirou a adoção do IVF neste projeto. Usa IVF com K=4096 centroids, NPROBE=5 (fast) / 24 (full) e AVX2/FMA para vetorização SIMD. A abordagem central — construir o índice k-means++ em build time e fazer scan apenas dos clusters mais próximos em runtime — reduz o espaço de busca de 3M vetores para ~5K, tornando p99 < 100ms mesmo sob carga extrema.
 

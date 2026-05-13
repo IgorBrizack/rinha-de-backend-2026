@@ -16,13 +16,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.05"
-          memory: "10MB"
+          cpus: "0.20"
+          memory: "30MB"
 
   api1:
     build: .
     environment:
       - SOCKET_PATH=/run/sockets/api1.sock
+      - GOMEMLIMIT=150MiB
     volumes:
       - sockets:/run/sockets
     networks:
@@ -36,13 +37,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.475"
-          memory: "170MB"
+          cpus: "0.40"
+          memory: "160MB"
 
   api2:
     build: .
     environment:
       - SOCKET_PATH=/run/sockets/api2.sock
+      - GOMEMLIMIT=150MiB
     volumes:
       - sockets:/run/sockets
     networks:
@@ -56,8 +58,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.475"
-          memory: "170MB"
+          cpus: "0.40"
+          memory: "160MB"
 
 volumes:
   sockets:
