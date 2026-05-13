@@ -15,14 +15,14 @@ import (
 const (
 	kNeighbors     = 5
 	fraudThreshold = 0.6
-	nProbe         = 16 // IVF: clusters to probe per query
+	nProbe         = 3 // IVF: clusters to probe per query (K=1024)
 )
 
 type KNN struct {
-	vectors  []int16
-	labels   []uint8
-	count    int
-	mccRisk  map[string]float64
+	vectors []int16
+	labels  []uint8
+	count   int
+	mccRisk map[string]float64
 
 	// IVF index (populated when binary was built with -ivf-k > 0)
 	centroids      []int16
@@ -136,6 +136,18 @@ type neighbor struct {
 	label uint8
 }
 
+type centDist struct {
+	dist int64
+	idx  int
+}
+
+var centDistPool = sync.Pool{
+	New: func() any {
+		s := make([]centDist, 1024)
+		return &s
+	},
+}
+
 func (k *KNN) Count() int { return k.count }
 
 func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
@@ -167,11 +179,10 @@ func (k *KNN) Score(input domain.FraudInput) domain.FraudResult {
 // ivfSearch finds k-nearest neighbours using the precomputed IVF index.
 // Scans only nProbe clusters instead of the full dataset.
 func (k *KNN) ivfSearch(qi16 [14]int16) ([kNeighbors]neighbor, int) {
-	type centDist struct {
-		dist int64
-		idx  int
-	}
-	cd := make([]centDist, k.ivfK)
+	cdPtr := centDistPool.Get().(*[]centDist)
+	cd := (*cdPtr)[:k.ivfK]
+	defer centDistPool.Put(cdPtr)
+
 	for c := 0; c < k.ivfK; c++ {
 		cd[c] = centDist{sqDist(qi16[:], k.centroids[c*14:c*14+14]), c}
 	}

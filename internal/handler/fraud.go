@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/IgorBrizack/rinha-de-backend-2026/internal/domain"
@@ -56,18 +57,24 @@ type FraudHandler struct {
 	uc *usecase.ScoreFraud
 }
 
+var fraudReqPool = sync.Pool{New: func() any { return new(fraudRequest) }}
+
 func NewFraudHandler(uc *usecase.ScoreFraud) *FraudHandler {
 	return &FraudHandler{uc: uc}
 }
 
 func (h *FraudHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var req fraudRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req := fraudReqPool.Get().(*fraudRequest)
+	req.LastTx = nil
+	req.Customer.KnownMerchants = req.Customer.KnownMerchants[:0]
+	defer fraudReqPool.Put(req)
+
+	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	input, err := mapToDomain(req)
+	input, err := mapToDomain(*req)
 	if err != nil {
 		http.Error(w, "invalid timestamp format", http.StatusBadRequest)
 		return
