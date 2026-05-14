@@ -20,7 +20,8 @@ services:
           memory: "30MB"
 
   api1:
-    build: .
+    image: ghcr.io/igorbrizack/rinha-de-backend-2026:latest
+    pull_policy: always
     environment:
       - SOCKET_PATH=/run/sockets/api1.sock
       - GOMEMLIMIT=150MiB
@@ -41,7 +42,8 @@ services:
           memory: "160MB"
 
   api2:
-    build: .
+    image: ghcr.io/igorbrizack/rinha-de-backend-2026:latest
+    pull_policy: always
     environment:
       - SOCKET_PATH=/run/sockets/api2.sock
       - GOMEMLIMIT=150MiB
