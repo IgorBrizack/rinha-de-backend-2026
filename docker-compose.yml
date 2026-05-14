@@ -21,6 +21,7 @@ services:
 
   api1:
     image: ghcr.io/igorbrizack/rinha-de-backend-2026:latest
+    pull_policy: always
     environment:
       - SOCKET_PATH=/run/sockets/api1.sock
     volumes:
@@ -41,6 +42,7 @@ services:
 
   api2:
     image: ghcr.io/igorbrizack/rinha-de-backend-2026:latest
+    pull_policy: always
     environment:
       - SOCKET_PATH=/run/sockets/api2.sock
     volumes:
